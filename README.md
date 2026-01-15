@@ -16,7 +16,7 @@ A comprehensive Linux privilege escalation enumeration script that automates the
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/Priv-enum.git
+git clone https://github.com/sidharth-v-s/Priv-enum.git
 cd Priv-enum
 chmod +x enum.sh
 ```
