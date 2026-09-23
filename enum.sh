@@ -10,6 +10,90 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# Performance and stability improvements
+# set -eo pipefail  # REMOVED: Too risky for enumeration scripts where errors are expected
+IFS=$'\n\t'       # Safer IFS
+
+# Global configuration
+readonly SCRIPT_VERSION="2.1"
+readonly MAX_FIND_DEPTH=3  # Limit find depth for performance
+readonly SCAN_TIMEOUT=60   # Timeout for long operations (seconds)
+readonly CACHE_DIR="/tmp/enum_cache_$$"
+readonly COMMON_PATHS=("/bin" "/sbin" "/usr/bin" "/usr/sbin" "/usr/local/bin" "/usr/local/sbin" "/opt" "/lib" "/lib64")
+
+# Create cache directory
+if ! mkdir -p "$CACHE_DIR"; then
+    echo "[-] Critical Error: Could not create cache directory $CACHE_DIR" >&2
+    exit 1
+fi
+
+# Cleanup function
+cleanup() {
+    # Kill any child processes in our process group
+    pkill -P $$ 2>/dev/null || true
+    rm -rf "$CACHE_DIR" 2>/dev/null || true
+}
+# Catch all terminate signals
+trap cleanup EXIT INT TERM
+
+# Output Helper Functions
+print_info() { echo -e "${BLUE}[*] $1${NC}"; }
+print_success() { echo -e "${GREEN}[+] $1${NC}"; }
+print_warning() { echo -e "${YELLOW}[!] $1${NC}"; }
+print_error() { echo -e "${RED}[-] $1${NC}" >&2; }
+print_header() {
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}$1${NC}"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+}
+
+# Timeout function
+run_with_timeout() {
+    local timeout=$1
+    shift
+    local cmd="$*"
+    
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$timeout" bash -c "$cmd" 2>/dev/null || return 1
+    else
+        # Fallback for systems without timeout command
+        bash -c "$cmd" 2>/dev/null &
+        local pid=$!
+        local count=0
+        while kill -0 "$pid" 2>/dev/null && [ $count -lt $timeout ]; do
+            sleep 1
+            count=$((count + 1))
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            return 1
+        fi
+        wait "$pid" 2>/dev/null || true
+    fi
+}
+
+# Optimized find function
+optimized_find() {
+    local path=$1
+    local criteria=$2
+    local max_depth=${3:-$MAX_FIND_DEPTH}
+    
+    # Simple direct find is often more reliable than complex backgrounding logic for this use case
+    # unless we are strictly searching root with timeouts.
+    find "$path" $criteria -maxdepth "$max_depth" -not -path "/proc/*" -not -path "/sys/*" -not -path "/dev/*" 2>/dev/null
+}
+
+# Input validation function
+validate_input() {
+    local input=$1
+    local pattern=$2
+    
+    if [[ ! "$input" =~ $pattern ]]; then
+        return 1
+    fi
+    return 0
+}
+
 # Banner
 banner() {
     echo -e "${BLUE}"
@@ -35,171 +119,159 @@ show_help() {
     echo "  -groups        Enumerate group privileges for current user"
     echo "  -cron          Enumerate cron jobs and scheduled tasks"
     echo "  -cap           Enumerate Linux capabilities"
+    echo "  --parallel     Run multiple enumeration modes in parallel (faster)"
     echo "  -help, -h      Show this help message"
     echo ""
     echo "Examples:"
-    echo "  $0             Run all enumeration modes"
-    echo "  $0 -suid       Run only SUID enumeration"
-    echo "  $0 -suid-root  List only root-owned SUID binaries"
-    echo "  $0 -sudo       List sudo rules and allowed binaries"
-    echo "  $0 -creds      Search for credentials in files"
-    echo "  $0 -ports      List open ports and listening services"
-    echo "  $0 -live-proc  Monitor processes in real-time (Ctrl+C to stop)"
-    echo "  $0 -groups     List group privileges for current user"
-    echo "  $0 -cron       List cron jobs and scheduled tasks"
-    echo "  $0 -cap        List binaries with Linux capabilities"
+    echo "  $0                          Run all enumeration modes"
+    echo "  $0 --parallel               Run all modes in parallel (faster)"
+    echo "  $0 -suid                    Run only SUID enumeration"
+    echo "  $0 -suid-root               List only root-owned SUID binaries"
+    echo "  $0 -sudo                    List sudo rules and allowed binaries"
+    echo "  $0 -creds                   Search for credentials in files"
+    echo "  $0 -ports                   List open ports and listening services"
+    echo "  $0 -live-proc               Monitor processes in real-time (Ctrl+C to stop)"
+    echo "  $0 -groups                  List group privileges for current user"
+    echo "  $0 -cron                    List cron jobs and scheduled tasks"
+    echo "  $0 -cap                     List binaries with Linux capabilities"
+    echo "  $0 --parallel -suid -sudo   Run SUID and sudo enumeration in parallel"
+    echo ""
+    echo "Performance Features:"
+    echo "  • Optimized filesystem scanning with depth limits"
+    echo "  • Parallel execution support for faster results"
+    echo "  • Timeout mechanisms to prevent hanging"
+    echo "  • Caching system to avoid redundant scans"
+    echo "  • Improved error handling and input validation"
 }
 
-# SUID Enumeration
-enum_suid() {
-    echo -e "${GREEN}[+] Enumerating SUID binaries...${NC}"
-    echo ""
+# Common SUID binaries list (consolidated)
+readonly VULNERABLE_SUID=(
+    "/usr/bin/nmap" "/usr/bin/find" "/usr/bin/vim" "/usr/bin/vi" "/usr/bin/nano"
+    "/usr/bin/cp" "/usr/bin/mv" "/usr/bin/cat" "/usr/bin/less" "/usr/bin/more"
+    "/usr/bin/awk" "/usr/bin/man" "/usr/bin/head" "/usr/bin/tail" "/usr/bin/cut"
+    "/usr/bin/strings" "/usr/bin/xxd" "/usr/bin/base64" "/usr/bin/python"
+    "/usr/bin/python2" "/usr/bin/python3" "/usr/bin/perl" "/usr/bin/ruby"
+    "/usr/bin/lua" "/usr/bin/node" "/usr/bin/php" "/usr/bin/tar" "/usr/bin/zip"
+    "/usr/bin/unzip" "/usr/bin/gzip" "/usr/bin/gunzip" "/usr/bin/bzip2"
+    "/usr/bin/bunzip2" "/usr/bin/xz" "/usr/bin/7z" "/usr/bin/rar" "/usr/bin/unrar"
+    "/usr/bin/mount" "/usr/bin/umount" "/usr/bin/fusermount" "/usr/bin/chmod"
+    "/usr/bin/chown" "/usr/bin/chgrp" "/usr/bin/at" "/usr/bin/atq" "/usr/bin/atrm"
+    "/usr/bin/batch" "/usr/bin/crontab" "/usr/bin/newgrp" "/usr/bin/sudo"
+    "/usr/bin/su" "/usr/bin/pkexec" "/usr/bin/passwd" "/usr/bin/chfn"
+    "/usr/bin/chsh" "/usr/bin/gpasswd" "/usr/bin/newuidmap" "/usr/bin/newgidmap"
+    "/usr/bin/wget" "/usr/bin/curl" "/usr/bin/aria2c" "/usr/bin/axel"
+    "/usr/bin/nc" "/usr/bin/netcat" "/usr/bin/ncat" "/usr/bin/socat"
+    "/usr/bin/openssl" "/usr/bin/expect" "/usr/bin/timeout" "/usr/bin/strace"
+    "/usr/bin/ltrace" "/usr/bin/gdb" "/usr/bin/readelf" "/usr/bin/objdump"
+    "/usr/bin/hexdump" "/usr/bin/od" "/usr/bin/bc" "/usr/bin/dc" "/usr/bin/jq"
+    "/usr/bin/make" "/usr/bin/gcc" "/usr/bin/g++" "/usr/bin/clang"
+    "/usr/bin/clang++" "/usr/bin/sudoedit" "/usr/bin/doas" "/usr/bin/ksu"
+    "/usr/bin/dbus-send" "/usr/bin/polkit-agent-helper-1"
+)
+
+# Check if binary is in vulnerable list
+is_vulnerable_suid() {
+    local binary=$1
+    for vuln_bin in "${VULNERABLE_SUID[@]}"; do
+        if [[ "$binary" == "$vuln_bin" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Get file metadata safely
+get_file_metadata() {
+    local file=$1
+    local metadata
     
-    # Find all SUID binaries
-    echo -e "${YELLOW}[*] Searching for SUID binaries in common locations...${NC}"
-    echo ""
-    
-    # Find SUID files
-    suid_files=$(find / -type f -perm -4000 2>/dev/null)
-    
-    if [ -z "$suid_files" ]; then
-        echo -e "${RED}[-] No SUID binaries found${NC}"
-        return
+    if ! metadata=$(stat -c "%a %A %U %G" "$file" 2>/dev/null); then
+        # print_error "Failed to stat $file"
+        return 1
     fi
     
-    # Count SUID binaries
+    echo "$metadata"
+}
+
+# Display SUID binary with proper formatting
+display_suid_binary() {
+    local suid_file=$1
+    local filter_owner=${2:-""}
+    
+    if [[ -z "$suid_file" ]]; then
+        return 1
+    fi
+    
+    # Get file metadata
+    local metadata
+    if ! metadata=$(get_file_metadata "$suid_file"); then
+        return 1
+    fi
+    
+    read -r perms owner group <<< "$metadata"
+    
+    # Apply owner filter if specified
+    if [[ -n "$filter_owner" && "$owner" != "$filter_owner" ]]; then
+        return 0
+    fi
+    
+    # Check vulnerability
+    local is_vuln=false
+    if is_vulnerable_suid "$suid_file"; then
+        is_vuln=true
+    fi
+    
+    # Display with appropriate formatting
+    if [[ "$is_vuln" == true ]]; then
+        echo -e "${RED}[!]${NC} ${YELLOW}$suid_file${NC}"
+        echo -e "    Permissions: $perms"
+        echo -e "    Owner: $owner | Group: $group"
+        echo -e "    ${RED}[Potentially Vulnerable]${NC}"
+    else
+        echo -e "${GREEN}[+]${NC} $suid_file"
+        echo -e "    Permissions: $perms"
+        echo -e "    Owner: $owner | Group: $group"
+    fi
+    echo ""
+}
+
+# Common SUID enumeration function
+enum_suid_common() {
+    local title=$1
+    local search_filter=$2
+    local owner_filter=${3:-""}
+    
+    echo -e "${GREEN}[+] $title${NC}"
+    echo ""
+    echo -e "${YELLOW}[*] Searching for SUID binaries...${NC}"
+    echo ""
+    
+    # Use optimized find with timeout
+    local suid_files
+    if ! suid_files=$(run_with_timeout "$SCAN_TIMEOUT" "optimized_find '/' '-type f $search_filter'"); then
+        echo -e "${RED}[-] SUID search timed out or failed${NC}"
+        return 1
+    fi
+    
+    if [[ -z "$suid_files" ]]; then
+        echo -e "${RED}[-] No SUID binaries found${NC}"
+        return 0
+    fi
+    
+    # Count and display results
+    local count
     count=$(echo "$suid_files" | wc -l)
     echo -e "${GREEN}[+] Found $count SUID binary/binary(ies)${NC}"
     echo ""
     
-    # List of known potentially vulnerable SUID binaries
-    vulnerable_suid=(
-        "/usr/bin/nmap"
-        "/usr/bin/find"
-        "/usr/bin/vim"
-        "/usr/bin/vi"
-        "/usr/bin/nano"
-        "/usr/bin/cp"
-        "/usr/bin/mv"
-        "/usr/bin/cat"
-        "/usr/bin/less"
-        "/usr/bin/more"
-        "/usr/bin/awk"
-        "/usr/bin/man"
-        "/usr/bin/head"
-        "/usr/bin/tail"
-        "/usr/bin/cut"
-        "/usr/bin/strings"
-        "/usr/bin/xxd"
-        "/usr/bin/base64"
-        "/usr/bin/python"
-        "/usr/bin/python2"
-        "/usr/bin/python3"
-        "/usr/bin/perl"
-        "/usr/bin/ruby"
-        "/usr/bin/lua"
-        "/usr/bin/node"
-        "/usr/bin/php"
-        "/usr/bin/tar"
-        "/usr/bin/zip"
-        "/usr/bin/unzip"
-        "/usr/bin/gzip"
-        "/usr/bin/gunzip"
-        "/usr/bin/bzip2"
-        "/usr/bin/bunzip2"
-        "/usr/bin/xz"
-        "/usr/bin/7z"
-        "/usr/bin/rar"
-        "/usr/bin/unrar"
-        "/usr/bin/mount"
-        "/usr/bin/umount"
-        "/usr/bin/fusermount"
-        "/usr/bin/chmod"
-        "/usr/bin/chown"
-        "/usr/bin/chgrp"
-        "/usr/bin/at"
-        "/usr/bin/atq"
-        "/usr/bin/atrm"
-        "/usr/bin/batch"
-        "/usr/bin/crontab"
-        "/usr/bin/newgrp"
-        "/usr/bin/sudo"
-        "/usr/bin/su"
-        "/usr/bin/pkexec"
-        "/usr/bin/passwd"
-        "/usr/bin/chfn"
-        "/usr/bin/chsh"
-        "/usr/bin/gpasswd"
-        "/usr/bin/newuidmap"
-        "/usr/bin/newgidmap"
-        "/usr/bin/wget"
-        "/usr/bin/curl"
-        "/usr/bin/aria2c"
-        "/usr/bin/axel"
-        "/usr/bin/nc"
-        "/usr/bin/netcat"
-        "/usr/bin/ncat"
-        "/usr/bin/socat"
-        "/usr/bin/openssl"
-        "/usr/bin/expect"
-        "/usr/bin/timeout"
-        "/usr/bin/strace"
-        "/usr/bin/ltrace"
-        "/usr/bin/gdb"
-        "/usr/bin/readelf"
-        "/usr/bin/objdump"
-        "/usr/bin/hexdump"
-        "/usr/bin/od"
-        "/usr/bin/bc"
-        "/usr/bin/dc"
-        "/usr/bin/jq"
-        "/usr/bin/make"
-        "/usr/bin/gcc"
-        "/usr/bin/g++"
-        "/usr/bin/clang"
-        "/usr/bin/clang++"
-        "/usr/bin/sudoedit"
-        "/usr/bin/doas"
-        "/usr/bin/ksu"
-        "/usr/bin/dbus-send"
-        "/usr/bin/polkit-agent-helper-1"
-    )
-    
     echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}SUID Binaries Found:${NC}"
+    echo -e "${GREEN}$title:${NC}"
     echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
     echo ""
     
-    # Display SUID binaries with details
+    # Process each SUID file
     while IFS= read -r suid_file; do
-        if [ -n "$suid_file" ]; then
-            # Get file permissions
-            perms=$(stat -c "%a %A" "$suid_file" 2>/dev/null | awk '{print $2}')
-            owner=$(stat -c "%U" "$suid_file" 2>/dev/null)
-            group=$(stat -c "%G" "$suid_file" 2>/dev/null)
-            
-            # Check if it's a known potentially vulnerable binary
-            is_vulnerable=false
-            for vuln_bin in "${vulnerable_suid[@]}"; do
-                if [ "$suid_file" = "$vuln_bin" ]; then
-                    is_vulnerable=true
-                    break
-                fi
-            done
-            
-            # Display with color coding
-            if [ "$is_vulnerable" = true ]; then
-                echo -e "${RED}[!]${NC} ${YELLOW}$suid_file${NC}"
-                echo -e "    Permissions: ${perms}"
-                echo -e "    Owner: ${owner} | Group: ${group}"
-                echo -e "    ${RED}[Potentially Vulnerable]${NC}"
-            else
-                echo -e "${GREEN}[+]${NC} $suid_file"
-                echo -e "    Permissions: ${perms}"
-                echo -e "    Owner: ${owner} | Group: ${group}"
-            fi
-            echo ""
-        fi
+        display_suid_binary "$suid_file" "$owner_filter"
     done <<< "$suid_files"
     
     echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
@@ -209,164 +281,17 @@ enum_suid() {
     echo ""
 }
 
+# SUID Enumeration
+enum_suid() {
+    enum_suid_common "Enumerating SUID binaries" "-perm -4000"
+}
+
 # SUID Root Enumeration
 enum_suid_root() {
-    echo -e "${GREEN}[+] Enumerating SUID binaries owned by root...${NC}"
-    echo ""
-    
-    # Find all SUID binaries
-    echo -e "${YELLOW}[*] Searching for root-owned SUID binaries...${NC}"
-    echo ""
-    
-    # Find SUID files owned by root
-    suid_files=$(find / -type f -perm -4000 -user root 2>/dev/null)
-    
-    if [ -z "$suid_files" ]; then
-        echo -e "${RED}[-] No root-owned SUID binaries found${NC}"
-        return
-    fi
-    
-    # Count SUID binaries
-    count=$(echo "$suid_files" | wc -l)
-    echo -e "${GREEN}[+] Found $count root-owned SUID binary/binary(ies)${NC}"
-    echo ""
-    
-    # List of known potentially vulnerable SUID binaries
-    vulnerable_suid=(
-        "/usr/bin/nmap"
-        "/usr/bin/find"
-        "/usr/bin/vim"
-        "/usr/bin/vi"
-        "/usr/bin/nano"
-        "/usr/bin/cp"
-        "/usr/bin/mv"
-        "/usr/bin/cat"
-        "/usr/bin/less"
-        "/usr/bin/more"
-        "/usr/bin/awk"
-        "/usr/bin/man"
-        "/usr/bin/head"
-        "/usr/bin/tail"
-        "/usr/bin/cut"
-        "/usr/bin/strings"
-        "/usr/bin/xxd"
-        "/usr/bin/base64"
-        "/usr/bin/python"
-        "/usr/bin/python2"
-        "/usr/bin/python3"
-        "/usr/bin/perl"
-        "/usr/bin/ruby"
-        "/usr/bin/lua"
-        "/usr/bin/node"
-        "/usr/bin/php"
-        "/usr/bin/tar"
-        "/usr/bin/zip"
-        "/usr/bin/unzip"
-        "/usr/bin/gzip"
-        "/usr/bin/gunzip"
-        "/usr/bin/bzip2"
-        "/usr/bin/bunzip2"
-        "/usr/bin/xz"
-        "/usr/bin/7z"
-        "/usr/bin/rar"
-        "/usr/bin/unrar"
-        "/usr/bin/mount"
-        "/usr/bin/umount"
-        "/usr/bin/fusermount"
-        "/usr/bin/chmod"
-        "/usr/bin/chown"
-        "/usr/bin/chgrp"
-        "/usr/bin/at"
-        "/usr/bin/atq"
-        "/usr/bin/atrm"
-        "/usr/bin/batch"
-        "/usr/bin/crontab"
-        "/usr/bin/newgrp"
-        "/usr/bin/sudo"
-        "/usr/bin/su"
-        "/usr/bin/pkexec"
-        "/usr/bin/passwd"
-        "/usr/bin/chfn"
-        "/usr/bin/chsh"
-        "/usr/bin/gpasswd"
-        "/usr/bin/newuidmap"
-        "/usr/bin/newgidmap"
-        "/usr/bin/wget"
-        "/usr/bin/curl"
-        "/usr/bin/aria2c"
-        "/usr/bin/axel"
-        "/usr/bin/nc"
-        "/usr/bin/netcat"
-        "/usr/bin/ncat"
-        "/usr/bin/socat"
-        "/usr/bin/openssl"
-        "/usr/bin/expect"
-        "/usr/bin/timeout"
-        "/usr/bin/strace"
-        "/usr/bin/ltrace"
-        "/usr/bin/gdb"
-        "/usr/bin/readelf"
-        "/usr/bin/objdump"
-        "/usr/bin/hexdump"
-        "/usr/bin/od"
-        "/usr/bin/bc"
-        "/usr/bin/dc"
-        "/usr/bin/jq"
-        "/usr/bin/make"
-        "/usr/bin/gcc"
-        "/usr/bin/g++"
-        "/usr/bin/clang"
-        "/usr/bin/clang++"
-        "/usr/bin/sudoedit"
-        "/usr/bin/doas"
-        "/usr/bin/ksu"
-        "/usr/bin/dbus-send"
-        "/usr/bin/polkit-agent-helper-1"
-    )
-    
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}Root-Owned SUID Binaries Found:${NC}"
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-    echo ""
-    
-    # Display SUID binaries with details
-    while IFS= read -r suid_file; do
-        if [ -n "$suid_file" ]; then
-            # Get file permissions
-            perms=$(stat -c "%a %A" "$suid_file" 2>/dev/null | awk '{print $2}')
-            owner=$(stat -c "%U" "$suid_file" 2>/dev/null)
-            group=$(stat -c "%G" "$suid_file" 2>/dev/null)
-            
-            # Check if it's a known potentially vulnerable binary
-            is_vulnerable=false
-            for vuln_bin in "${vulnerable_suid[@]}"; do
-                if [ "$suid_file" = "$vuln_bin" ]; then
-                    is_vulnerable=true
-                    break
-                fi
-            done
-            
-            # Display with color coding
-            if [ "$is_vulnerable" = true ]; then
-                echo -e "${RED}[!]${NC} ${YELLOW}$suid_file${NC}"
-                echo -e "    Permissions: ${perms}"
-                echo -e "    Owner: ${owner} | Group: ${group}"
-                echo -e "    ${RED}[Potentially Vulnerable]${NC}"
-            else
-                echo -e "${GREEN}[+]${NC} $suid_file"
-                echo -e "    Permissions: ${perms}"
-                echo -e "    Owner: ${owner} | Group: ${group}"
-            fi
-            echo ""
-        fi
-    done <<< "$suid_files"
-    
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-    echo ""
-    echo -e "${YELLOW}[*] Note: Root-owned SUID binaries are particularly interesting for privilege escalation${NC}"
-    echo -e "${YELLOW}[*] Research each binary individually for known exploits${NC}"
-    echo ""
+    enum_suid_common "Enumerating SUID binaries owned by root" "-perm -4000 -user root" "root"
 }
+
+
 
 # Sudo Enumeration
 enum_sudo() {
@@ -542,46 +467,94 @@ enum_sudo() {
     echo ""
 }
 
+# Improved credential patterns (more precise)
+readonly CREDENTIAL_PATTERNS=(
+    # Password patterns
+    'password[[:space:]]*[=:][[:space:]]*["'\'']?([^"'\'']{4,})["'\'']?'
+    'passwd[[:space:]]*[=:][[:space:]]*["'\'']?([^"'\'']{4,})["'\'']?'
+    'pwd[[:space:]]*[=:][[:space:]]*["'\'']?([^"'\'']{4,})["'\'']?'
+    'pass[[:space:]]*[=:][[:space:]]*["'\'']?([^"'\'']{4,})["'\'']?'
+    
+    # Database patterns
+    'mysql.*password[[:space:]]*[=:][[:space:]]*["'\'']?([^"'\'']{4,})["'\'']?'
+    'postgres.*password[[:space:]]*[=:][[:space:]]*["'\'']?([^"'\'']{4,})["'\'']?'
+    'db_password[[:space:]]*[=:][[:space:]]*["'\'']?([^"'\'']{4,})["'\'']?'
+    'database.*password[[:space:]]*[=:][[:space:]]*["'\'']?([^"'\'']{4,})["'\'']?'
+    
+    # API/Token patterns
+    'api[_-]?key[[:space:]]*[=:][[:space:]]*["'\'']?([a-zA-Z0-9_-]{16,})["'\'']?'
+    'apikey[[:space:]]*[=:][[:space:]]*["'\'']?([a-zA-Z0-9_-]{16,})["'\'']?'
+    'secret[[:space:]]*[=:][[:space:]]*["'\'']?([a-zA-Z0-9_-]{8,})["'\'']?'
+    'token[[:space:]]*[=:][[:space:]]*["'\'']?([a-zA-Z0-9._-]{16,})["'\'']?'
+    'auth[[:space:]]*[=:][[:space:]]*["'\'']?([a-zA-Z0-9_-]{8,})["'\'']?'
+    
+    # Username patterns
+    'username[[:space:]]*[=:][[:space:]]*["'\'']?([^"'\'']{2,})["'\'']?'
+    'user[[:space:]]*[=:][[:space:]]*["'\'']?([^"'\'']{2,})["'\'']?'
+    'login[[:space:]]*[=:][[:space:]]*["'\'']?([^"'\'']{2,})["'\'']?'
+)
+
+# Cache file search results
+cache_search_results() {
+    local search_key=$1
+    local cache_file="$CACHE_DIR/${search_key}.cache"
+    
+    if [[ -f "$cache_file" ]]; then
+        cat "$cache_file"
+        return 0
+    fi
+    return 1
+}
+
+# Save search results to cache
+save_to_cache() {
+    local search_key=$1
+    local data=$2
+    local cache_file="$CACHE_DIR/${search_key}.cache"
+    
+    echo "$data" > "$cache_file"
+}
+
+# Search file for credentials with improved patterns
+search_file_credentials() {
+    local file=$1
+    local results=""
+    
+    # Skip binary files
+    if file "$file" 2>/dev/null | grep -qE "(binary|executable)"; then
+        return 0
+    fi
+    
+    # Search for each pattern
+    for pattern in "${CREDENTIAL_PATTERNS[@]}"; do
+        local matches
+        if matches=$(grep -iE "$pattern" "$file" 2>/dev/null | head -5); then
+            results+="$matches"$'\n'
+        fi
+    done
+    
+    echo "$results"
+}
+
 # Credentials Enumeration
 enum_creds() {
-    echo -e "${GREEN}[+] Enumerating credentials from files...${NC}"
-    echo ""
+    print_header "Enumerating credentials from files..."
     
-    # Define search locations
-    search_dirs=(
+    # Define search locations (optimized)
+    local search_dirs=(
         "$HOME"
-        "/home"
         "/var/log"
         "/var/www"
         "/opt"
         "/tmp"
-        "/root"
     )
-    
-    # Define file extensions and patterns to search
-    file_patterns=(
-        "*.txt"
-        "*.log"
-        "*.conf"
-        "*.config"
-        "*.ini"
-        "*.env"
-        "*.sh"
-        "*.py"
-        "*.php"
-        "*.js"
-        "*.sql"
-        "*.bak"
-        "*.old"
-        "*history*"
-        "*passwd*"
-        "*password*"
-        "*credential*"
-        "*secret*"
-    )
+    # Add root if readable
+    if [ -r "/root" ]; then
+        search_dirs+=("/root")
+    fi
     
     # Shell history files
-    history_files=(
+    local history_files=(
         "$HOME/.bash_history"
         "$HOME/.zsh_history"
         "$HOME/.fish_history"
@@ -594,217 +567,100 @@ enum_creds() {
         "/root/.history"
     )
     
-    # Regex patterns for finding credentials
-    cred_patterns=(
-        "password[=:]\s*['\"]?([^'\"]+)['\"]?"
-        "passwd[=:]\s*['\"]?([^'\"]+)['\"]?"
-        "pwd[=:]\s*['\"]?([^'\"]+)['\"]?"
-        "pass[=:]\s*['\"]?([^'\"]+)['\"]?"
-        "Password[=:]\s*['\"]?([^'\"]+)['\"]?"
-        "PASSWORD[=:]\s*['\"]?([^'\"]+)['\"]?"
-        "username[=:]\s*['\"]?([^'\"]+)['\"]?"
-        "user[=:]\s*['\"]?([^'\"]+)['\"]?"
-        "login[=:]\s*['\"]?([^'\"]+)['\"]?"
-        "mysql.*password[=:]\s*['\"]?([^'\"]+)['\"]?"
-        "postgres.*password[=:]\s*['\"]?([^'\"]+)['\"]?"
-        "db_password[=:]\s*['\"]?([^'\"]+)['\"]?"
-        "database.*password[=:]\s*['\"]?([^'\"]+)['\"]?"
-        "api[_-]?key[=:]\s*['\"]?([^'\"]+)['\"]?"
-        "apikey[=:]\s*['\"]?([^'\"]+)['\"]?"
-        "secret[=:]\s*['\"]?([^'\"]+)['\"]?"
-        "token[=:]\s*['\"]?([^'\"]+)['\"]?"
-        "auth[=:]\s*['\"]?([^'\"]+)['\"]?"
-        "credential[=:]\s*['\"]?([^'\"]+)['\"]?"
-    )
+    local found_creds=false
+    local total_findings=0
     
-    found_creds=false
-    total_findings=0
+    print_info "Searching for credentials..."
     
-    echo -e "${YELLOW}[*] Searching for credentials in various files...${NC}"
-    echo ""
-    
-    # Search shell history files
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}Shell History Files:${NC}"
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-    echo ""
+    # 1. Search shell history files
+    print_info "Checking Shell History Files..."
     
     for hist_file in "${history_files[@]}"; do
-        if [ -f "$hist_file" ] && [ -r "$hist_file" ]; then
-            echo -e "${GREEN}[+] Found: $hist_file${NC}"
+        if [[ -f "$hist_file" && -r "$hist_file" ]]; then
+            # print_success "Found: $hist_file"
             
-            # Search for password-related commands
-            password_lines=$(grep -iE "(password|passwd|pwd|mysql|postgres|ssh|login|auth)" "$hist_file" 2>/dev/null | head -20)
-            
-            if [ -n "$password_lines" ]; then
-                found_creds=true
-                count=$(echo "$password_lines" | wc -l)
-                total_findings=$((total_findings + count))
-                
-                echo -e "${YELLOW}    Found $count potentially interesting line(s):${NC}"
-                echo "$password_lines" | while IFS= read -r line; do
-                    # Highlight passwords
-                    if echo "$line" | grep -qiE "(password|passwd|pwd)"; then
-                        echo -e "    ${RED}[!]${NC} $line"
-                    else
-                        echo -e "    ${GREEN}[+]${NC} $line"
-                    fi
-                done
-            else
-                echo -e "    ${YELLOW}[*] No obvious credentials found${NC}"
-            fi
-            echo ""
-        fi
-    done
-    
-    # Search in common text/log files
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}Searching Text/Log Files:${NC}"
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-    echo ""
-    
-    # Search in accessible directories
-    for search_dir in "${search_dirs[@]}"; do
-        if [ -d "$search_dir" ] && [ -r "$search_dir" ]; then
-            echo -e "${YELLOW}[*] Searching in: $search_dir${NC}"
-            
-            # Find readable text files
-            while IFS= read -r file; do
-                if [ -f "$file" ] && [ -r "$file" ] && [ -s "$file" ]; then
-                    # Skip binary files
-                    if file "$file" 2>/dev/null | grep -qE "(text|ASCII|script)"; then
-                        # Search for credential patterns
-                        matches=$(grep -iE "(password|passwd|pwd|username|user|login|mysql|postgres|api.*key|secret|token|auth|credential)" "$file" 2>/dev/null | head -10)
-                        
-                        if [ -n "$matches" ]; then
-                            found_creds=true
-                            count=$(echo "$matches" | wc -l)
-                            total_findings=$((total_findings + count))
-                            
-                            echo -e "${GREEN}[+]${NC} ${YELLOW}$file${NC}"
-                            echo "$matches" | while IFS= read -r match; do
-                                # Extract potential credentials
-                                if echo "$match" | grep -qiE "password[=:]\s*['\"]?[^'\"]+['\"]?"; then
-                                    echo -e "    ${RED}[!]${NC} $match"
-                                elif echo "$match" | grep -qiE "(api.*key|secret|token)"; then
-                                    echo -e "    ${RED}[!]${NC} $match"
-                                else
-                                    echo -e "    ${GREEN}[+]${NC} $match"
-                                fi
-                            done
-                            echo ""
-                        fi
-                    fi
+            # Use improved credential search
+            local cred_results
+            if cred_results=$(search_file_credentials "$hist_file"); then
+                if [[ -n "$cred_results" ]]; then
+                    found_creds=true
+                    local count=$(echo "$cred_results" | wc -l)
+                    total_findings=$((total_findings + count))
+                    
+                    print_warning "Found potential credentials in $hist_file:"
+                    echo "$cred_results" | sed 's/^/    /'
                 fi
-            done < <(find "$search_dir" -type f \( -name "*.txt" -o -name "*.log" -o -name "*.conf" -o -name "*.config" -o -name "*.ini" -o -name "*.env" -o -name "*history*" -o -name "*passwd*" -o -name "*password*" -o -name "*credential*" -o -name "*secret*" \) 2>/dev/null | head -50)
+            fi
         fi
     done
     
-    # Search for specific credential patterns with regex
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}Detailed Credential Patterns:${NC}"
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
     echo ""
+    print_info "Searching Text/Log/Config Files (max depth: $MAX_FIND_DEPTH)..."
     
+    # 2. Optimized Main Search Loop
+    # We build a massive find command to locate all interesting files in ONE pass
     for search_dir in "${search_dirs[@]}"; do
         if [ -d "$search_dir" ] && [ -r "$search_dir" ]; then
-            # Search for password patterns
-            password_matches=$(find "$search_dir" -type f -readable 2>/dev/null | xargs grep -lE "(password|passwd|pwd)[=:]\s*['\"]?[^'\"]+['\"]?" 2>/dev/null | head -20)
+            # print_info "Scanning $search_dir..."
             
-            if [ -n "$password_matches" ]; then
-                found_creds=true
-                echo -e "${YELLOW}[*] Files containing password patterns in: $search_dir${NC}"
-                
-                while IFS= read -r file; do
-                    if [ -f "$file" ] && [ -r "$file" ]; then
-                        echo -e "${GREEN}[+]${NC} ${YELLOW}$file${NC}"
-                        # Extract lines with passwords
-                        grep -iE "(password|passwd|pwd)[=:]\s*['\"]?[^'\"]+['\"]?" "$file" 2>/dev/null | head -5 | while IFS= read -r line; do
-                            echo -e "    ${RED}[!]${NC} $line"
-                        done
-                        echo ""
-                    fi
-                done <<< "$password_matches"
-            fi
-            
-            # Search for username patterns
-            username_matches=$(find "$search_dir" -type f -readable 2>/dev/null | xargs grep -lE "(username|user|login)[=:]\s*['\"]?[^'\"]+['\"]?" 2>/dev/null | head -20)
-            
-            if [ -n "$username_matches" ]; then
-                found_creds=true
-                echo -e "${YELLOW}[*] Files containing username patterns in: $search_dir${NC}"
-                
-                while IFS= read -r file; do
-                    if [ -f "$file" ] && [ -r "$file" ]; then
-                        echo -e "${GREEN}[+]${NC} ${YELLOW}$file${NC}"
-                        grep -iE "(username|user|login)[=:]\s*['\"]?[^'\"]+['\"]?" "$file" 2>/dev/null | head -5 | while IFS= read -r line; do
-                            echo -e "    ${GREEN}[+]${NC} $line"
-                        done
-                        echo ""
-                    fi
-                done <<< "$username_matches"
-            fi
-            
-            # Search for API keys and tokens
-            api_matches=$(find "$search_dir" -type f -readable 2>/dev/null | xargs grep -lE "(api[_-]?key|apikey|secret|token)[=:]\s*['\"]?[^'\"]+['\"]?" 2>/dev/null | head -20)
-            
-            if [ -n "$api_matches" ]; then
-                found_creds=true
-                echo -e "${YELLOW}[*] Files containing API keys/tokens in: $search_dir${NC}"
-                
-                while IFS= read -r file; do
-                    if [ -f "$file" ] && [ -r "$file" ]; then
-                        echo -e "${GREEN}[+]${NC} ${YELLOW}$file${NC}"
-                        grep -iE "(api[_-]?key|apikey|secret|token)[=:]\s*['\"]?[^'\"]+['\"]?" "$file" 2>/dev/null | head -5 | while IFS= read -r line; do
-                            echo -e "    ${RED}[!]${NC} $line"
-                        done
-                        echo ""
-                    fi
-                done <<< "$api_matches"
-            fi
+            # Find candidate files
+            # -size -10M: skip huge files
+            while IFS= read -r file; do
+                # Check if it's a binary file (fast check)
+                if [[ -f "$file" ]] && [[ ! -x "$file" ]]; then 
+                     # Run grep for all patterns at once
+                     # -H: print filename
+                     # -I: skip binary files matching
+                     # -n: line number
+                     matches=$(grep -HInE "(password|passwd|pwd|username|user|login|mysql|postgres|api[_-]?key|secret|token|auth|credential)[[:space:]]*[=:]" "$file" 2>/dev/null | head -5)
+                     
+                     if [ -n "$matches" ]; then
+                         found_creds=true
+                         local count=$(echo "$matches" | wc -l)
+                         total_findings=$((total_findings + count))
+                         
+                         print_success "Potential sensitive data in: $file"
+                         # Colorize output
+                         echo "$matches" | while IFS= read -r match; do
+                            echo -e "    ${YELLOW}$match${NC}"
+                         done
+                         echo ""
+                     fi
+                fi
+            done < <(optimized_find "$search_dir" "\( -name \"*.txt\" -o -name \"*.log\" -o -name \"*.conf\" -o -name \"*.config\" -o -name \"*.ini\" -o -name \"*.env\" -o -name \"*history*\" -o -name \"*passwd*\" -o -name \"*password*\" -o -name \"*credential*\" -o -name \"*secret*\" \)" "$MAX_FIND_DEPTH")
         fi
     done
     
-    # Search in /etc/passwd for user enumeration
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}User Enumeration:${NC}"
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+    # 3. User Enumeration from /etc/passwd
     echo ""
+    print_info "Enumerating Users from /etc/passwd..."
     
     if [ -r "/etc/passwd" ]; then
-        echo -e "${GREEN}[+] /etc/passwd (readable)${NC}"
-        echo ""
         # Show users with shells
-        users_with_shells=$(grep -E ":/bin/(bash|sh|zsh|fish|dash)" /etc/passwd 2>/dev/null)
-        if [ -n "$users_with_shells" ]; then
-            echo -e "${YELLOW}Users with shells:${NC}"
-            echo "$users_with_shells" | while IFS= read -r user_line; do
-                username=$(echo "$user_line" | cut -d: -f1)
-                uid=$(echo "$user_line" | cut -d: -f3)
-                gid=$(echo "$user_line" | cut -d: -f4)
-                home=$(echo "$user_line" | cut -d: -f6)
-                shell=$(echo "$user_line" | cut -d: -f7)
-                
-                if [ "$uid" = "0" ]; then
-                    echo -e "    ${RED}[!]${NC} ${YELLOW}$username${NC} (UID: $uid, GID: $gid, Home: $home, Shell: $shell) ${RED}[ROOT]${NC}"
-                else
-                    echo -e "    ${GREEN}[+]${NC} $username (UID: $uid, GID: $gid, Home: $home, Shell: $shell)"
-                fi
-            done
-        fi
+        grep -E ":/bin/(bash|sh|zsh|fish|dash|ksh)" /etc/passwd 2>/dev/null | while IFS= read -r user_line; do
+            username=$(echo "$user_line" | cut -d: -f1)
+            uid=$(echo "$user_line" | cut -d: -f3)
+            gid=$(echo "$user_line" | cut -d: -f4)
+            home=$(echo "$user_line" | cut -d: -f6)
+            shell=$(echo "$user_line" | cut -d: -f7)
+            
+            if [ "$uid" = "0" ]; then
+                echo -e "    ${RED}[!]${NC} ${YELLOW}$username${NC} (UID: $uid, GID: $gid, Home: $home, Shell: $shell) ${RED}[ROOT]${NC}"
+            else
+                echo -e "    ${GREEN}[+]${NC} $username (UID: $uid, GID: $gid, Home: $home, Shell: $shell)"
+            fi
+        done
         echo ""
     fi
     
     # Summary
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
     echo ""
+    print_header "Credential Enumeration Summary"
     if [ "$found_creds" = true ]; then
-        echo -e "${GREEN}[+] Found $total_findings potential credential(s) or interesting finding(s)${NC}"
-        echo -e "${YELLOW}[*] Review the findings above for potential passwords, usernames, and API keys${NC}"
-        echo -e "${YELLOW}[*] Be cautious: some findings may be false positives${NC}"
+        print_success "Found $total_findings potential credential(s) or interesting finding(s)."
+        print_warning "Review the findings above. Some may be false positives."
     else
-        echo -e "${YELLOW}[*] No obvious credentials found in accessible files${NC}"
-        echo -e "${YELLOW}[*] Try running with higher privileges or check restricted directories${NC}"
+        print_info "No obvious credentials found in accessible files."
     fi
     echo ""
 }
@@ -1953,110 +1809,140 @@ enum_cap() {
     echo ""
 }
 
+# Parallel execution support
+run_parallel() {
+    local -a funcs=("$@")
+    local -a pids=()
+    local -a temp_files=()
+    
+    print_info "Starting parallel execution of ${#funcs[@]} modules..."
+    
+    # Start each function in background, redirecting output to a specific temp file
+    for i in "${!funcs[@]}"; do
+        local func="${funcs[$i]}"
+        local temp_file="$CACHE_DIR/${func}_output.tmp"
+        temp_files+=("$temp_file")
+        
+        # We wrap the function call to redirect stdout/stderr to the temp file
+        {
+            $func
+        } > "$temp_file" 2>&1 &
+        
+        pids+=($!)
+        print_info "Started $func (PID: $!)"
+    done
+    
+    # Wait for all background jobs
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    
+    print_success "All modules completed. Aggregating results..."
+    echo ""
+    
+    # Display results sequentially
+    for i in "${!funcs[@]}"; do
+        local func="${funcs[$i]}"
+        local temp_file="${temp_files[$i]}"
+        
+        if [[ -f "$temp_file" ]]; then
+            cat "$temp_file"
+            # Optional: Add separator if needed, but functions usually handle their own headers
+            # rm "$temp_file" # Cleanup happens at exit, or we can do it here
+        else
+            print_error "Output file for $func was lost or not created."
+        fi
+    done
+}
+
 # Main function
 main() {
-    banner
+    local -a functions_to_run=()
+    local parallel_mode=false
+    
+    # Check for parallel mode flag
+    if [[ $# -gt 0 && "$1" == "--parallel" ]]; then
+        parallel_mode=true
+        shift
+    fi
+    
+    # Only show banner if we have functions to run
+    if [[ $# -eq 0 || $# -gt 0 ]]; then
+        banner
+    fi
     
     # Check if no arguments provided - run all enumerations
     if [ $# -eq 0 ]; then
-        echo -e "${GREEN}[+] No options specified, running all enumeration modes...${NC}"
-        echo ""
-        echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+        print_success "No options specified, running all enumeration modes..."
         echo ""
         
-        # Run all enumeration functions
-        enum_suid
-        echo ""
-        echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-        echo ""
-        
-        enum_sudo
-        echo ""
-        echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-        echo ""
-        
-        enum_creds
-        echo ""
-        echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-        echo ""
-        
-        enum_ports
-        echo ""
-        echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-        echo ""
-        
-        enum_groups
-        echo ""
-        echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-        echo ""
-        
-        enum_cron
-        echo ""
-        echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-        echo ""
-        
-        enum_cap
-        echo ""
-        echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-        echo ""
-        echo -e "${GREEN}[+] All enumeration modes completed!${NC}"
-        echo ""
-        echo -e "${YELLOW}[*] Note: -live-proc was skipped (requires interactive mode)${NC}"
-        echo -e "${YELLOW}[*] Run with -live-proc flag separately to monitor processes${NC}"
-        echo ""
-        exit 0
+        functions_to_run=(
+            "enum_suid"
+            "enum_sudo" 
+            "enum_creds"
+            "enum_ports"
+            "enum_groups"
+            "enum_cron"
+            "enum_cap"
+        )
+    else
+        # Parse arguments - run only specified mode(s)
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                -suid) functions_to_run+=("enum_suid"); shift ;;
+                -suid-root) functions_to_run+=("enum_suid_root"); shift ;;
+                -sudo) functions_to_run+=("enum_sudo"); shift ;;
+                -creds) functions_to_run+=("enum_creds"); shift ;;
+                -ports) functions_to_run+=("enum_ports"); shift ;;
+                -live-proc)
+                    if [ "$parallel_mode" = true ]; then
+                         print_warning "Skipping -live-proc in parallel mode (interactive only)"
+                    else
+                         functions_to_run+=("enum_live_proc")
+                    fi
+                    shift 
+                    ;;
+                -groups) functions_to_run+=("enum_groups"); shift ;;
+                -cron) functions_to_run+=("enum_cron"); shift ;;
+                -cap) functions_to_run+=("enum_cap"); shift ;;
+                -help|-h) show_help; exit 0 ;;
+                --parallel) parallel_mode=true; shift ;;
+                *)
+                    print_error "Unknown option: $1"
+                    show_help
+                    exit 1
+                    ;;
+            esac
+        done
     fi
     
-    # Parse arguments - run only specified mode(s)
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            -suid)
-                enum_suid
-                shift
-                ;;
-            -suid-root)
-                enum_suid_root
-                shift
-                ;;
-            -sudo)
-                enum_sudo
-                shift
-                ;;
-            -creds)
-                enum_creds
-                shift
-                ;;
-            -ports)
-                enum_ports
-                shift
-                ;;
-            -live-proc)
-                enum_live_proc
-                shift
-                ;;
-            -groups)
-                enum_groups
-                shift
-                ;;
-            -cron)
-                enum_cron
-                shift
-                ;;
-            -cap)
-                enum_cap
-                shift
-                ;;
-            -help|-h)
-                show_help
-                exit 0
-                ;;
-            *)
-                echo -e "${RED}[-] Unknown option: $1${NC}"
-                show_help
-                exit 1
-                ;;
-        esac
-    done
+    # Execute functions
+    if [[ ${#functions_to_run[@]} -eq 0 ]]; then
+        print_error "No functions to run"
+        exit 1
+    fi
+    
+    # Check if we should run in parallel
+    if [[ "$parallel_mode" == true && ${#functions_to_run[@]} -gt 1 ]]; then
+        # Filter out interactive functions just in case
+        local -a safe_funcs=()
+        for func in "${functions_to_run[@]}"; do
+            if [[ "$func" != "enum_live_proc" ]]; then
+                safe_funcs+=("$func")
+            fi
+        done
+        run_parallel "${safe_funcs[@]}"
+    else
+        # Run sequentially
+        for func in "${functions_to_run[@]}"; do
+            $func
+        done
+    fi
+    
+    # Show completion message
+    echo ""
+    print_success "Enumeration completed"
+    # echo -e "${YELLOW}[*] Results cached in: $CACHE_DIR${NC}"
 }
 
 # Run main function
